@@ -85,6 +85,7 @@ mod clone_entities;
 mod entity_meta_table;
 mod entity_set;
 mod map_entities;
+mod remote_allocator;
 #[cfg(feature = "bevy_reflect")]
 use bevy_reflect::Reflect;
 #[cfg(all(feature = "bevy_reflect", feature = "serialize"))]
@@ -94,6 +95,7 @@ pub use clone_entities::*;
 use derive_more::derive::Display;
 pub use entity_set::*;
 pub use map_entities::*;
+pub use remote_allocator::RemoteEntityAllocator;
 
 mod hash;
 pub use hash::*;
