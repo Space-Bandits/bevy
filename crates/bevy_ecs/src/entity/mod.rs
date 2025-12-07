@@ -82,6 +82,7 @@
 //! [`Commands`]: crate::system::Commands
 
 mod clone_entities;
+mod entity_meta_table;
 mod entity_set;
 mod map_entities;
 #[cfg(feature = "bevy_reflect")]
@@ -855,14 +856,22 @@ unsafe impl EntitySetIterator for AllocEntitiesIterator<'_> {}
 
 /// [`Entities`] tracks all known [`EntityIndex`]s and their metadata.
 /// This is like a base table of information all entities have.
+///
+/// Internally, this uses a paged structure ([`EntityMetaTable`]) for efficient
+/// storage and lookup of entity metadata. The paged design allows for:
+/// - Sparse entity indices without wasting memory
+/// - Stable page pointers for concurrent access patterns
+/// - Good cache locality for sequential entity access
 #[derive(Debug, Clone)]
 pub struct Entities {
-    meta: Vec<EntityMeta>,
+    meta: EntityMetaTable,
 }
 
 impl Entities {
     pub(crate) const fn new() -> Self {
-        Self { meta: Vec::new() }
+        Self {
+            meta: EntityMetaTable::new(),
+        }
     }
 
     /// Clears all entity information
@@ -876,8 +885,7 @@ impl Entities {
     /// See the module [docs](crate::entity) for a full explanation of these ids, entity life cycles, and the meaning of this result.
     #[inline]
     pub fn get_spawned(&self, entity: Entity) -> Result<EntityLocation, EntityNotSpawnedError> {
-        let meta = self.meta.get(entity.index_u32() as usize);
-        let meta = meta.unwrap_or(&EntityMeta::FRESH);
+        let meta = self.meta.get_or_fresh(entity.index());
         if entity.generation() != meta.generation {
             return Err(EntityNotSpawnedError::Invalid(InvalidEntityError {
                 entity,
@@ -916,7 +924,7 @@ impl Entities {
     #[inline]
     pub fn resolve_from_index(&self, index: EntityIndex) -> Entity {
         self.meta
-            .get(index.index() as usize)
+            .get(index)
             .map(|meta| Entity::from_index_and_generation(index, meta.generation))
             .unwrap_or(Entity::from_index(index))
     }
@@ -927,7 +935,7 @@ impl Entities {
     #[inline]
     pub fn is_index_spawned(&self, index: EntityIndex) -> bool {
         self.meta
-            .get(index.index() as usize)
+            .get(index)
             .is_some_and(|meta| meta.location.is_some())
     }
 
@@ -973,8 +981,8 @@ impl Entities {
         index: EntityIndex,
         location: Option<EntityLocation>,
     ) -> Option<EntityLocation> {
-        // SAFETY: Caller guarantees that `index` already had a location, so `declare` must have made the index valid already.
-        let meta = unsafe { self.meta.get_unchecked_mut(index.index() as usize) };
+        // SAFETY: Caller guarantees that `index` already had a location, so `ensure_index` must have made the index valid already.
+        let meta = unsafe { self.meta.get_unchecked_mut(index) };
         mem::replace(&mut meta.location, location)
     }
 
@@ -991,26 +999,9 @@ impl Entities {
         index: EntityIndex,
         location: Option<EntityLocation>,
     ) -> Option<EntityLocation> {
-        self.ensure_index_index_is_valid(index);
+        self.meta.ensure_index(index);
         // SAFETY: We just did `ensure_index`
         self.update_existing_location(index, location)
-    }
-
-    /// Ensures the index is within the bounds of [`Self::meta`], expanding it if necessary.
-    #[inline]
-    fn ensure_index_index_is_valid(&mut self, index: EntityIndex) {
-        #[cold] // to help with branch prediction
-        fn expand(meta: &mut Vec<EntityMeta>, len: usize) {
-            meta.resize(len, EntityMeta::FRESH);
-            // Set these up too while we're here.
-            meta.resize(meta.capacity(), EntityMeta::FRESH);
-        }
-
-        let index = index.index() as usize;
-        if self.meta.len() <= index {
-            // TODO: hint unlikely once stable.
-            expand(&mut self.meta, index + 1);
-        }
     }
 
     /// Marks the `index` as free, returning the [`Entity`] to reuse that [`EntityIndex`].
@@ -1020,9 +1011,9 @@ impl Entities {
     /// - `index` must be despawned (have no location) already.
     pub(crate) unsafe fn mark_free(&mut self, index: EntityIndex, generations: u32) -> Entity {
         // We need to do this in case an entity is being freed that was never spawned.
-        self.ensure_index_index_is_valid(index);
+        self.meta.ensure_index(index);
         // SAFETY: We just did `ensure_index`
-        let meta = unsafe { self.meta.get_unchecked_mut(index.index() as usize) };
+        let meta = unsafe { self.meta.get_unchecked_mut(index) };
 
         let (new_generation, aliased) = meta.generation.after_versions_and_could_alias(generations);
         meta.generation = new_generation;
@@ -1044,8 +1035,8 @@ impl Entities {
         by: MaybeLocation,
         tick: Tick,
     ) {
-        // SAFETY: Caller guarantees that `index` already had a location, so `declare` must have made the index valid already.
-        let meta = unsafe { self.meta.get_unchecked_mut(index.index() as usize) };
+        // SAFETY: Caller guarantees that `index` already had a location, so `ensure_index` must have been called already.
+        let meta = unsafe { self.meta.get_unchecked_mut(index) };
         meta.spawned_or_despawned = SpawnedOrDespawned { by, tick };
     }
 
@@ -1076,11 +1067,11 @@ impl Entities {
     #[inline]
     fn entity_get_spawned_or_despawned(&self, entity: Entity) -> Option<SpawnedOrDespawned> {
         self.meta
-            .get(entity.index_u32() as usize)
+            .get(entity.index())
             .filter(|meta|
             // Generation is incremented immediately upon despawn
-            (meta.generation == entity.generation)
-            || (meta.location.is_none() && meta.generation == entity.generation.after_versions(1)))
+            (meta.generation == entity.generation())
+            || (meta.location.is_none() && meta.generation == entity.generation().after_versions(1)))
             .map(|meta| meta.spawned_or_despawned)
     }
 
@@ -1097,15 +1088,13 @@ impl Entities {
         entity: Entity,
     ) -> (MaybeLocation, Tick) {
         // SAFETY: caller ensures entity is allocated
-        let meta = unsafe { self.meta.get_unchecked(entity.index_u32() as usize) };
+        let meta = unsafe { self.meta.get_unchecked(entity.index()) };
         (meta.spawned_or_despawned.by, meta.spawned_or_despawned.tick)
     }
 
     #[inline]
     pub(crate) fn check_change_ticks(&mut self, check: CheckChangeTicks) {
-        for meta in &mut self.meta {
-            meta.spawned_or_despawned.tick.check_tick(check);
-        }
+        self.meta.check_change_ticks(check);
     }
 
     /// The count of currently allocated entity indices.
@@ -1126,16 +1115,13 @@ impl Entities {
     /// See the module docs for a more precise explanation of what spawning means.
     /// Be aware that this is O(n) and is intended only to be used as a diagnostic for tests.
     pub fn count_spawned(&self) -> u32 {
-        self.meta
-            .iter()
-            .filter(|meta| meta.location.is_some())
-            .count() as u32
+        self.meta.count_where(|meta| meta.location.is_some()) as u32
     }
 
     /// Returns true if there are any entity indices currently spawned.
     /// See the module docs for a more precise explanation of what spawning means.
     pub fn any_spawned(&self) -> bool {
-        self.meta.iter().any(|meta| meta.location.is_some())
+        self.meta.any_where(|meta| meta.location.is_some())
     }
 }
 
@@ -1209,33 +1195,8 @@ impl EntityNotSpawnedError {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-struct EntityMeta {
-    /// The current [`EntityGeneration`] of the [`EntityIndex`].
-    generation: EntityGeneration,
-    /// The current location of the [`EntityIndex`].
-    location: Option<EntityLocation>,
-    /// Location and tick of the last spawn/despawn
-    spawned_or_despawned: SpawnedOrDespawned,
-}
-
-#[derive(Copy, Clone, Debug)]
-struct SpawnedOrDespawned {
-    by: MaybeLocation,
-    tick: Tick,
-}
-
-impl EntityMeta {
-    /// The metadata for a fresh entity: Never spawned/despawned, no location, etc.
-    const FRESH: EntityMeta = EntityMeta {
-        generation: EntityGeneration::FIRST,
-        location: None,
-        spawned_or_despawned: SpawnedOrDespawned {
-            by: MaybeLocation::caller(),
-            tick: Tick::new(0),
-        },
-    };
-}
+// EntityMeta and SpawnedOrDespawned are defined in entity_meta_table module
+use entity_meta_table::{EntityMetaTable, SpawnedOrDespawned};
 
 /// A location of an entity in an archetype.
 #[derive(Copy, Clone, Debug, PartialEq)]
