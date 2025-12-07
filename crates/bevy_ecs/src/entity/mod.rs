@@ -695,12 +695,57 @@ impl SparseSetIndex for Entity {
     }
 }
 
-/// Allocates [`Entity`] ids uniquely.
-/// This is used in [`World::spawn_at`](crate::world::World::spawn_at) and [`World::despawn_no_free`](crate::world::World::despawn_no_free) to track entity ids no longer in use.
+/// A trait for types that can allocate [`Entity`] ids.
+///
+/// This trait enables custom entity allocation strategies, such as:
+/// - **Local allocation**: The default, using a free list and incrementing counter
+/// - **Remote allocation**: For networked games where a server controls entity ID assignment
+/// - **Range-based allocation**: For allocating consecutive entity indices (useful for tilemaps)
+///
+/// # Concurrent Allocation
+///
+/// The [`alloc`](Self::alloc) and [`alloc_many`](Self::alloc_many) methods take `&self` rather than
+/// `&mut self`, allowing concurrent allocation from multiple threads. Implementations must ensure
+/// thread-safety through internal synchronization (e.g., atomics).
+///
+/// # Freeing Entities
+///
+/// The [`free`](Self::free) method requires `&mut self` as it modifies the free list.
+/// This is called when an entity is despawned and its ID should be recycled.
+pub trait AllocateEntities {
+    /// Allocates a single [`Entity`] id.
+    ///
+    /// This can be called concurrently from multiple threads.
+    /// The returned entity is valid but not yet spawned.
+    fn alloc(&self) -> Entity;
+
+    /// Allocates multiple [`Entity`] ids efficiently.
+    ///
+    /// This can be called concurrently from multiple threads.
+    /// Returns an iterator over the allocated entities.
+    fn alloc_many(&self, count: u32) -> impl Iterator<Item = Entity>;
+
+    /// Returns an entity to the allocator's free list for reuse.
+    ///
+    /// The entity's generation should be incremented before calling this
+    /// to prevent aliasing with previously held references.
+    fn free(&mut self, entity: Entity);
+}
+
+/// The default entity allocator that manages entity ID allocation locally.
+///
+/// This is used in [`World::spawn_at`](crate::world::World::spawn_at) and
+/// [`World::despawn_no_free`](crate::world::World::despawn_no_free) to track entity ids no longer in use.
 /// Allocating is fully concurrent and can be done from multiple threads.
 ///
-/// Conceptually, this is a collection of [`Entity`] ids who's [`EntityIndex`] is despawned and who's [`EntityGeneration`] is the most recent.
+/// Conceptually, this is a collection of [`Entity`] ids whose [`EntityIndex`] is despawned
+/// and whose [`EntityGeneration`] is the most recent.
 /// See the module docs for how these ids and this allocator participate in the life cycle of an entity.
+///
+/// # Custom Allocators
+///
+/// For advanced use cases, you can implement the [`AllocateEntities`] trait to create
+/// custom allocation strategies. See the trait documentation for more details.
 #[derive(Default, Debug)]
 pub struct EntityAllocator {
     /// All the entities to reuse.
@@ -817,6 +862,23 @@ impl EntityAllocator {
             reuse: self.free[reuse].iter(),
             new,
         }
+    }
+}
+
+impl AllocateEntities for EntityAllocator {
+    #[inline]
+    fn alloc(&self) -> Entity {
+        EntityAllocator::alloc(self)
+    }
+
+    #[inline]
+    fn alloc_many(&self, count: u32) -> impl Iterator<Item = Entity> {
+        EntityAllocator::alloc_many(self, count)
+    }
+
+    #[inline]
+    fn free(&mut self, entity: Entity) {
+        EntityAllocator::free(self, entity)
     }
 }
 
