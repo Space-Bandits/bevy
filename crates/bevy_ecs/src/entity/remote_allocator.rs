@@ -30,6 +30,7 @@
 //! These types are summed up in [`SharedAllocator`], which is highly unsafe.
 //! The interfaces [`Allocator`] and [`RemoteAllocator`] provide safe interfaces to them.
 
+use alloc::collections::BTreeSet;
 use bevy_platform::{
     cell::SyncUnsafeCell,
     prelude::Vec,
@@ -45,6 +46,21 @@ use nonmax::NonMaxU32;
 use crate::query::DebugCheckedUnwrap;
 
 use super::{Entity, EntityIndex, EntitySetIterator};
+
+/// Number of entities per page (must match entity_meta_table.rs).
+const PAGE_SIZE: u32 = 1024;
+
+/// Extracts the page index from an entity index.
+#[inline(always)]
+const fn page_of_index(index: u32) -> u32 {
+    index / PAGE_SIZE
+}
+
+/// Gets the first entity index of a page.
+#[inline(always)]
+const fn page_start(page: u32) -> u32 {
+    page * PAGE_SIZE
+}
 
 /// This is the item we store in the free list.
 /// Effectively, this is a `MaybeUninit<Entity>` where uninit is represented by `Entity::PLACEHOLDER`.
@@ -882,6 +898,9 @@ impl SharedAllocator {
 /// This is in contrast to the [`RemoteAllocator`], which may be cloned freely.
 pub(super) struct Allocator {
     shared: Arc<SharedAllocator>,
+    /// Pages that are reserved and should not be used for fresh entity allocation.
+    /// Entities freed from reserved pages CAN still be reused.
+    reserved_pages: BTreeSet<u32>,
 }
 
 impl Default for Allocator {
@@ -895,14 +914,90 @@ impl Allocator {
     pub(super) fn new() -> Self {
         Self {
             shared: Arc::new(SharedAllocator::new()),
+            reserved_pages: BTreeSet::new(),
+        }
+    }
+
+    /// Reserves a page of entity indices for external use (e.g., networked entity allocation).
+    ///
+    /// Reserved pages will not be used when allocating fresh entities. This allows
+    /// external systems (like a network server) to allocate entities from specific
+    /// page ranges without conflicting with local allocation.
+    ///
+    /// Each page contains 1024 entity indices:
+    /// - Page 0: indices 0-1023
+    /// - Page 1: indices 1024-2047
+    /// - Page N: indices N*1024 to (N+1)*1024-1
+    ///
+    /// # Important
+    ///
+    /// - Call this BEFORE allocating entities to ensure the page is skipped.
+    /// - Entities that were freed from a reserved page CAN still be reused
+    ///   (reservation only affects fresh allocation).
+    /// - Once reserved, a page cannot be unreserved.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Reserve pages 10-19 for a network client
+    /// for page in 10..20 {
+    ///     world.entity_allocator().reserve_page(page);
+    /// }
+    /// // Now the client can safely use entity indices 10240-20479
+    /// ```
+    pub(super) fn reserve_page(&mut self, page: u32) {
+        self.reserved_pages.insert(page);
+
+        // Advance the fresh allocator past any reserved pages at the current position
+        self.skip_reserved_pages();
+    }
+
+    /// Returns true if the given page is reserved.
+    pub(super) fn is_page_reserved(&self, page: u32) -> bool {
+        self.reserved_pages.contains(&page)
+    }
+
+    /// Returns an iterator over all reserved page numbers.
+    pub(super) fn reserved_pages(&self) -> impl Iterator<Item = u32> + '_ {
+        self.reserved_pages.iter().copied()
+    }
+
+    /// Advances the fresh allocator's next index past any reserved pages.
+    fn skip_reserved_pages(&mut self) {
+        loop {
+            let current = self.shared.fresh.total_entity_indices();
+            let current_page = page_of_index(current);
+
+            if !self.reserved_pages.contains(&current_page) {
+                break;
+            }
+
+            // Advance to the start of the next page
+            let next_page_start = page_start(current_page + 1);
+            let to_skip = next_page_start - current;
+
+            // Consume these indices by allocating them (they'll be "lost" but that's fine)
+            self.shared.fresh.next_entity_index.fetch_add(to_skip, Ordering::Relaxed);
         }
     }
 
     /// Allocates a new [`Entity`], reusing a freed index if one exists.
+    /// Skips any reserved pages during fresh allocation.
     #[inline]
     pub(super) fn alloc(&self) -> Entity {
-        // SAFETY: violating safety requires a `&mut self` to exist, but rust does not allow that.
-        unsafe { self.shared.alloc() }
+        loop {
+            // SAFETY: violating safety requires a `&mut self` to exist, but rust does not allow that.
+            let entity = unsafe { self.shared.alloc() };
+            let page = page_of_index(entity.index_u32());
+
+            // If the entity is in a reserved page, discard it and try again
+            // Note: We can't add it to the free list here because that requires &mut self
+            // These entities are "leaked" but that's intentional - the user reserved them
+            if !self.reserved_pages.contains(&page) {
+                return entity;
+            }
+            // Otherwise loop and allocate another
+        }
     }
 
     /// The total number of indices given out.

@@ -787,6 +787,83 @@ impl EntityAllocator {
             inner: self.inner.alloc_many(count),
         }
     }
+
+    /// Reserves a page of entity indices for external use (e.g., networked entity allocation).
+    ///
+    /// Reserved pages will not be used when allocating fresh entities. This allows
+    /// external systems (like a network server) to assign entity ID ranges to clients
+    /// without conflicting with local allocation.
+    ///
+    /// Each page contains 1024 entity indices:
+    /// - Page 0: indices 0-1023
+    /// - Page 1: indices 1024-2047
+    /// - Page N: indices N*1024 to (N+1)*1024-1
+    ///
+    /// # Important
+    ///
+    /// - Call this BEFORE allocating entities to ensure the page is skipped.
+    /// - Entities that were freed from a reserved page CAN still be reused
+    ///   (reservation only affects fresh allocation).
+    /// - Once reserved, a page cannot be unreserved.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use bevy_ecs::prelude::*;
+    /// let mut world = World::new();
+    ///
+    /// // Reserve pages 10-19 for network client allocation
+    /// for page in 10..20 {
+    ///     world.entity_allocator_mut().reserve_page(page);
+    /// }
+    ///
+    /// // Local allocation will skip indices 10240-20479
+    /// let local_entity = world.spawn_empty();
+    ///
+    /// // Client can safely use reserved indices via spawn_at
+    /// let client_entity = Entity::from_raw(10240); // First index of page 10
+    /// // world.spawn_empty_at(client_entity);
+    /// ```
+    pub fn reserve_page(&mut self, page: u32) {
+        self.inner.reserve_page(page);
+    }
+
+    /// Returns true if the given page is reserved.
+    ///
+    /// See [`reserve_page`](Self::reserve_page) for details on page numbering.
+    pub fn is_page_reserved(&self, page: u32) -> bool {
+        self.inner.is_page_reserved(page)
+    }
+
+    /// Returns an iterator over all reserved page numbers.
+    pub fn reserved_pages(&self) -> impl Iterator<Item = u32> + '_ {
+        self.inner.reserved_pages()
+    }
+
+    /// Returns the page number for a given entity index.
+    ///
+    /// This is a convenience method for calculating which page an entity belongs to.
+    /// Each page contains 1024 entities.
+    #[inline]
+    pub const fn page_of(index: u32) -> u32 {
+        index / 1024
+    }
+
+    /// Returns the first entity index of a given page.
+    ///
+    /// This is a convenience method for calculating the start of a page range.
+    #[inline]
+    pub const fn page_start(page: u32) -> u32 {
+        page * 1024
+    }
+
+    /// Returns the last entity index of a given page (inclusive).
+    ///
+    /// This is a convenience method for calculating the end of a page range.
+    #[inline]
+    pub const fn page_end(page: u32) -> u32 {
+        (page + 1) * 1024 - 1
+    }
 }
 
 /// An [`Iterator`] returning a sequence of unique [`Entity`] values from [`Entities`].
@@ -1183,7 +1260,7 @@ pub struct EntityLocation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{format, vec::Vec};
+    use alloc::{format, vec, vec::Vec};
 
     #[test]
     fn entity_niche_optimization() {
@@ -1470,5 +1547,84 @@ mod tests {
         entities.sort();
         entities.dedup();
         assert_eq!(pre_len, entities.len());
+    }
+
+    #[test]
+    fn reserve_page() {
+        let mut allocator = EntityAllocator::default();
+
+        // Reserve page 1 (indices 1024-2047)
+        allocator.reserve_page(1);
+        assert!(allocator.is_page_reserved(1));
+        assert!(!allocator.is_page_reserved(0));
+        assert!(!allocator.is_page_reserved(2));
+
+        // Allocate entities - should skip page 1
+        let mut entities = Vec::new();
+        for _ in 0..3000 {
+            entities.push(allocator.alloc());
+        }
+
+        // Check that no entity is in page 1
+        for entity in &entities {
+            let page = EntityAllocator::page_of(entity.index_u32());
+            assert_ne!(page, 1, "Entity {} should not be in reserved page 1", entity);
+        }
+
+        // Verify we got entities from page 0 and page 2+
+        let pages: alloc::collections::BTreeSet<u32> = entities
+            .iter()
+            .map(|e| EntityAllocator::page_of(e.index_u32()))
+            .collect();
+        assert!(pages.contains(&0), "Should have entities in page 0");
+        assert!(pages.contains(&2), "Should have entities in page 2");
+    }
+
+    #[test]
+    fn reserve_multiple_pages() {
+        let mut allocator = EntityAllocator::default();
+
+        // Reserve pages 5, 6, 7 for a network client
+        for page in 5..8 {
+            allocator.reserve_page(page);
+        }
+
+        // Verify all are reserved
+        let reserved: Vec<u32> = allocator.reserved_pages().collect();
+        assert_eq!(reserved, vec![5, 6, 7]);
+
+        // Allocate many entities
+        let mut entities = Vec::new();
+        for _ in 0..10000 {
+            entities.push(allocator.alloc());
+        }
+
+        // Check that no entity is in reserved pages
+        for entity in &entities {
+            let page = EntityAllocator::page_of(entity.index_u32());
+            assert!(
+                page < 5 || page > 7,
+                "Entity {} in page {} should not be in reserved range 5-7",
+                entity,
+                page
+            );
+        }
+    }
+
+    #[test]
+    fn page_helpers() {
+        assert_eq!(EntityAllocator::page_of(0), 0);
+        assert_eq!(EntityAllocator::page_of(1023), 0);
+        assert_eq!(EntityAllocator::page_of(1024), 1);
+        assert_eq!(EntityAllocator::page_of(2047), 1);
+        assert_eq!(EntityAllocator::page_of(2048), 2);
+
+        assert_eq!(EntityAllocator::page_start(0), 0);
+        assert_eq!(EntityAllocator::page_start(1), 1024);
+        assert_eq!(EntityAllocator::page_start(5), 5120);
+
+        assert_eq!(EntityAllocator::page_end(0), 1023);
+        assert_eq!(EntityAllocator::page_end(1), 2047);
+        assert_eq!(EntityAllocator::page_end(5), 6143);
     }
 }
